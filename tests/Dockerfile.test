@@ -1,0 +1,14 @@
+FROM python:3.11-slim-bookworm
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libpcre2-dev \
+    libpcre3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install uwsgi
+
+WORKDIR /plugin
+COPY . /plugin/
+
+CMD ["python3", "/plugin/tests/test_ipv6.py"]

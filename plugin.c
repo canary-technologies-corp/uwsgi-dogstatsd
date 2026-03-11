@@ -1,4 +1,5 @@
 #include <uwsgi.h>
+#include <netdb.h>
 
 #define MAX_BUFFER_SIZE 8192
 
@@ -11,6 +12,7 @@ this is a stats pusher plugin for DogStatsD:
 example:
 
 --stats-push dogstatsd:127.0.0.1:8125,myinstance
+--stats-push dogstatsd:[::1]:8125,myinstance
 
 exports values exposed by the metric subsystem to a Datadog Agent StatsD server
 
@@ -36,11 +38,87 @@ static struct uwsgi_option dogstatsd_options[] = {
 // configuration of a dogstatsd node
 struct dogstatsd_node {
   int fd;
-  union uwsgi_sockaddr addr;
+  struct sockaddr_storage addr;
   socklen_t addr_len;
   char *prefix;
   uint16_t prefix_len;
 };
+
+/*
+ * Create a non-blocking UDP socket for the given address string.
+ *
+ * Supports IPv4, IPv6, and hostnames (including AAAA-only DNS records):
+ *   "127.0.0.1:8125"       - IPv4 literal
+ *   "[::1]:8125"           - IPv6 literal (RFC 3986 bracket notation)
+ *   "statsd.svc.local:8125" - hostname resolved via getaddrinfo(AF_UNSPEC)
+ *
+ * On success, populates addr/addr_len with the resolved address and returns
+ * a non-blocking UDP socket file descriptor.
+ * On failure, logs the error and returns -1.
+ */
+static int dogstatsd_create_udp_socket(char *arg, struct sockaddr_storage *addr, socklen_t *addr_len) {
+  char *host_start = arg;
+  char *port_str = NULL;
+  char host_buf[256];
+  size_t host_len;
+
+  if (host_start[0] == '[') {
+    /* Bracketed IPv6: skip '[', find ']', expect ':' after it */
+    host_start++;
+    char *bracket = strchr(host_start, ']');
+    if (!bracket || bracket[1] != ':') {
+      uwsgi_log("invalid dd address %s\n", arg);
+      return -1;
+    }
+    port_str = bracket + 2;
+    host_len = bracket - host_start;
+  } else {
+    /* IPv4 or hostname: split on the first colon */
+    char *colon = strchr(host_start, ':');
+    if (!colon) {
+      uwsgi_log("invalid dd address %s\n", arg);
+      return -1;
+    }
+    port_str = colon + 1;
+    host_len = colon - host_start;
+  }
+
+  /* Reject empty host or port */
+  if (host_len == 0 || host_len >= sizeof(host_buf) || *port_str == '\0') {
+    uwsgi_log("invalid dd address %s\n", arg);
+    return -1;
+  }
+
+  /* Copy host into a local buffer for getaddrinfo (needs null-terminated) */
+  memcpy(host_buf, host_start, host_len);
+  host_buf[host_len] = '\0';
+
+  /* Resolve address — AF_UNSPEC lets the OS return IPv4 or IPv6 */
+  struct addrinfo hints, *res;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_DGRAM;
+  hints.ai_flags = AI_NUMERICSERV;
+
+  int gai_ret = getaddrinfo(host_buf, port_str, &hints, &res);
+  if (gai_ret != 0) {
+    uwsgi_log("invalid dd address %s: %s\n", arg, gai_strerror(gai_ret));
+    return -1;
+  }
+
+  memcpy(addr, res->ai_addr, res->ai_addrlen);
+  *addr_len = res->ai_addrlen;
+  int fd = socket(res->ai_family, SOCK_DGRAM, 0);
+  freeaddrinfo(res);
+
+  if (fd < 0) {
+    uwsgi_error("dogstatsd_create_udp_socket()/socket()");
+    return -1;
+  }
+
+  uwsgi_socket_nb(fd);
+  return fd;
+}
 
 static int dogstatsd_generate_tags(char *metric, size_t metric_len, char *datatog_metric_name, char *datadog_tags) {
   char *start = metric;
@@ -169,7 +247,7 @@ static int dogstatsd_send_metric(struct uwsgi_buffer *ub, struct uwsgi_stats_pus
     if (uwsgi_buffer_append(ub, datadog_tags, strlen(datadog_tags))) return -1;
   }
 
-  if (sendto(sn->fd, ub->buf, ub->pos, 0, (struct sockaddr *) &sn->addr.sa_in, sn->addr_len) < 0) {
+  if (sendto(sn->fd, ub->buf, ub->pos, 0, (struct sockaddr *) &sn->addr, sn->addr_len) < 0) {
     uwsgi_error("dogstatsd_send_metric()/sendto()");
   }
 
@@ -192,23 +270,12 @@ static void stats_pusher_dogstatsd(struct uwsgi_stats_pusher_instance *uspi, tim
       sn->prefix_len = 5;
     }
 
-    char *colon = strchr(uspi->arg, ':');
-    if (!colon) {
-      uwsgi_log("invalid dd address %s\n", uspi->arg);
+    sn->fd = dogstatsd_create_udp_socket(uspi->arg, &sn->addr, &sn->addr_len);
+    if (sn->fd < 0) {
       if (comma) *comma = ',';
       free(sn);
       return;
     }
-    sn->addr_len = socket_to_in_addr(uspi->arg, colon, 0, &sn->addr.sa_in);
-
-    sn->fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sn->fd < 0) {
-      uwsgi_error("stats_pusher_dogstatsd()/socket()");
-      if (comma) *comma = ',';
-                        free(sn);
-                        return;
-    }
-    uwsgi_socket_nb(sn->fd);
     if (comma) *comma = ',';
     uspi->data = sn;
     uspi->configured = 1;
